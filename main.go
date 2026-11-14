@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getlantern/systray"
 	"tinygo.org/x/bluetooth"
 )
 
@@ -18,7 +19,45 @@ const switchBotCompanyID = 0x0969
 var adapter = bluetooth.DefaultAdapter
 
 func main() {
-	// 環境変数からターゲットMACアドレスを取得
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Println("\n終了シグナルを受信しました。終了します...")
+		_ = adapter.StopScan()
+		os.Exit(0)
+	}()
+
+	systray.Run(onReady, onExit)
+}
+
+func onReady() {
+	systray.SetTitle("SwitchBot Hub2")
+	systray.SetTooltip("SwitchBot ハブ2 監視中...")
+
+	mStatus := systray.AddMenuItem("温湿度データ待機中...", "最新の温湿度")
+	mStatus.Disable()
+
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("終了", "アプリを終了します")
+
+	go startBLEScanner(mStatus)
+
+	go func() {
+		for range mQuit.ClickedCh {
+			fmt.Println("トレイメニューから終了が選択されました。")
+			_ = adapter.StopScan()
+			systray.Quit()
+			os.Exit(0)
+		}
+	}()
+}
+
+func onExit() {
+	_ = adapter.StopScan()
+}
+
+func startBLEScanner(mStatus *systray.MenuItem) {
 	targetMAC := os.Getenv("SWITCHBOT_MAC")
 	if targetMAC == "" {
 		fmt.Println("[警告] 環境変数 SWITCHBOT_MAC が設定されていません。周辺の全 SwitchBot 機器をスキャンします。")
@@ -30,55 +69,53 @@ func main() {
 		log.Fatalf("Bluetoothアダプターの有効化に失敗しました: %v", err)
 	}
 
-	// Ctrl+C (SIGINT) を捕捉して安全にスキャン停止する処理
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Println("\nスキャンを停止して終了します...")
-		_ = adapter.StopScan()
-		os.Exit(0)
-	}()
-
-	fmt.Println("SwitchBot BLEスキャンを開始します... (終了: Ctrl+C)")
-
+	// 前回記録した値を保持（変化検知用）
 	var lastTemp float64 = -999
 	var lastHum int = -1
 
-	err := adapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
-		addr := device.Address.String()
+	for {
+		err := adapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
+			addr := device.Address.String()
+			if targetMAC != "" && !strings.EqualFold(addr, targetMAC) {
+				return
+			}
 
-		// ターゲットMACが指定されている場合はフィルタリング（大文字小文字を区別しない）
-		if targetMAC != "" && !strings.EqualFold(addr, targetMAC) {
-			return
-		}
+			for _, mfg := range device.ManufacturerData() {
+				if mfg.CompanyID == switchBotCompanyID {
+					temp, hum, ok := parseHub2Data(mfg.Data)
+					if !ok {
+						continue
+					}
 
-		for _, mfg := range device.ManufacturerData() {
-			if mfg.CompanyID == switchBotCompanyID {
-				temp, hum, ok := parseHub2Data(mfg.Data)
-				if !ok {
-					continue
-				}
+					// 温度または湿度が変化した場合のみ処理を実行
+					if temp != lastTemp || hum != lastHum {
+						lastTemp = temp
+						lastHum = hum
 
-				if temp != lastTemp || hum != lastHum {
-					lastTemp = temp
-					lastHum = hum
-					absHum := calcAbsoluteHumidity(temp, float64(hum))
-					now := time.Now().Format("2006-01-02 15:04:05")
+						absHum := calcAbsoluteHumidity(temp, float64(hum))
+						now := time.Now().Format("15:04:05")
 
-					fmt.Printf("[%s] MAC: %s | 温度: %.1f ℃ | 相対湿度: %d %% | 絶対湿度: %.2f g/m³ (RSSI: %d) [Raw12..15: %X]\n",
-						now, addr, temp, hum, absHum, device.RSSI, mfg.Data[12:16])
+						// ツールチップとメニュー表示を更新
+						tooltipText := fmt.Sprintf("室温: %.1f℃ / 湿度: %d%% / 絶対湿度: %.2f g/m³ (%s)", temp, hum, absHum, now)
+						menuText := fmt.Sprintf("🌡️ %.1f℃ | 💧 %d%% | ☁️ %.2f g/m³ (%s)", temp, hum, absHum, now)
+
+						systray.SetTooltip(tooltipText)
+						mStatus.SetTitle(menuText)
+
+						fmt.Printf("[%s] 温度: %.1f ℃ | 湿度: %d %% | 絶対湿度: %.2f g/m³ (RSSI: %d)\n",
+							now, temp, hum, absHum, device.RSSI)
+					}
 				}
 			}
-		}
-	})
+		})
 
-	if err != nil {
-		log.Fatalf("スキャンエラー: %v", err)
+		if err != nil {
+			fmt.Printf("スキャンエラー (再試行します): %v\n", err)
+			time.Sleep(3 * time.Second)
+		}
 	}
 }
 
-// パース処理（data[13] 小数点部、data[14] 整数部＆符号、data[15] 湿度）
 func parseHub2Data(data []byte) (float64, int, bool) {
 	if len(data) < 16 {
 		return 0, 0, false
